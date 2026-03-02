@@ -1,0 +1,203 @@
+{{- include "requiredValues" . -}}
+---
+# 1. DEDICATED SERVICE ACCOUNT (Used by both platforms for better security)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "mychart.fullname" . }}-kube-bench
+  namespace: {{ include "mychart.namespace" . }}
+  labels:
+    {{- include "mychart.labels" . | nindent 4 }}
+    app: kube-bench
+
+{{- /* --- OPENSHIFT ONLY: SCC BINDING --- */ -}}
+{{- if .Values.isOpenShift }}
+---
+# 2. PRIVILEGED SCC BINDING FOR OPENSHIFT
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "mychart.fullname" . }}-kube-bench-privileged
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:privileged
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "mychart.fullname" . }}-kube-bench
+    namespace: {{ include "mychart.namespace" . }}
+{{- end }}
+
+---
+# 3. KUBE-BENCH DAEMONSET
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "mychart.fullname" . }}-kube-bench-monitor
+  namespace: {{ include "mychart.namespace" . }}
+  labels:
+    {{- include "mychart.labels" . | nindent 4 }}
+    app: kube-bench
+spec:
+  selector:
+    matchLabels:
+      {{- include "mychart.selectorLabels" . | nindent 6 }}
+      app: kube-bench
+  template:
+    metadata:
+      labels:
+        {{- include "mychart.selectorLabels" . | nindent 8 }}
+        app: kube-bench
+    spec:
+      serviceAccountName: {{ include "mychart.fullname" . }}-kube-bench
+      hostPID: true
+      # Master Node Tolerations
+      tolerations:
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      
+      restartPolicy: Always
+      containers:
+        - name: kube-bench
+          # FIXED: Bypasses Docker Hub Rate Limit using mirror
+          image: mirror.gcr.io/aquasec/kube-bench:latest 
+          command: ["/bin/sh", "-c"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          args: 
+            - |
+              # SETTING: Scan every 1 Hour (3600 seconds) to save CPU
+              INTERVAL=3600
+              
+              while true; do
+                echo "{\"status\": \"scan_started\", \"node\": \"$NODE_NAME\", \"message\": \"Starting kube-bench scan on $NODE_NAME...\"}"
+                
+                # --- TRULY UNIVERSAL AUTO-DETECTION START ---
+                KB_FLAGS=""
+                
+                # 1. Check for K3s (Must exist AND not be empty)
+                if [ -d /var/lib/rancher/k3s ] && [ "$(ls -A /var/lib/rancher/k3s 2>/dev/null)" ]; then
+                   echo "Detected K3s. Forcing K3s Benchmark."
+                   KB_FLAGS="--benchmark k3s-cis-1.24"
+                
+                # 2. Check for RKE2
+                elif [ -d /var/lib/rancher/rke2 ] && [ "$(ls -A /var/lib/rancher/rke2 2>/dev/null)" ]; then
+                   echo "Detected RKE2. Forcing RKE2 Benchmark."
+                   KB_FLAGS="--benchmark rke2-cis-1.24"
+
+                # 3. Check for MicroK8s
+                elif [ -d /var/snap/microk8s ] && [ "$(ls -A /var/snap/microk8s 2>/dev/null)" ]; then
+                   echo "Detected MicroK8s. Forcing MicroK8s Benchmark."
+                   KB_FLAGS="--benchmark cis-1.24-microk8s" 
+
+                # 4. Check for OpenShift
+                elif [ -d /etc/machine-config-daemon ] && [ "$(ls -A /etc/machine-config-daemon 2>/dev/null)" ]; then
+                   echo "Detected OpenShift. Forcing OpenShift Benchmark."
+                   KB_FLAGS="--benchmark rh-1.4"
+                
+                # 5. Fallback for AKS / EKS / GKE / Vanilla
+                else
+                   echo "Detected Standard/Cloud Cluster. Using Auto-Detection."
+                fi
+                # --- TRULY UNIVERSAL AUTO-DETECTION END ---
+
+                # Run Scan with the detected flags
+                kube-bench $KB_FLAGS --json | jq --unbuffered -c --arg node "$NODE_NAME" '.Controls[].tests[].results[] | if (.status == "FAIL" or .status == "WARN") and (.remediation != null and (.remediation | test("No remediation required|No remediation is required"; "i"))) then .status="PASS" else . end | {Node: $node, ID: .test_number, Problem: .test_desc, Status: .status, Solution: .remediation}'                
+                echo "{\"status\": \"scan_completed\", \"node\": \"$NODE_NAME\", \"message\": \"Scan finished, waiting ${INTERVAL}s...\"}"
+                sleep $INTERVAL; 
+              done
+          volumeMounts:
+            - name: var-lib-rancher 
+              mountPath: /var/lib/rancher
+              readOnly: true
+            - name: var-snap            
+              mountPath: /var/snap
+              readOnly: true
+            - name: etc-origin          
+              mountPath: /etc/origin
+              readOnly: true
+            - name: etc-systemd
+              mountPath: /etc/systemd
+              readOnly: true
+            - name: etc-kubernetes
+              mountPath: /etc/kubernetes
+              readOnly: true
+            - name: lib-systemd
+              mountPath: /lib/systemd
+              readOnly: true
+            - name: usr-lib
+              mountPath: /usr/lib/systemd
+              readOnly: true
+            - name: var-lib-etcd
+              mountPath: /var/lib/etcd
+              readOnly: true
+            - name: var-lib-kubelet
+              mountPath: /var/lib/kubelet
+              readOnly: true
+            - name: etc-passwd
+              mountPath: /etc/passwd
+              readOnly: true
+            - name: etc-group
+              mountPath: /etc/group
+              readOnly: true
+            # UNIVERSAL: OpenShift mounts are now applied safely on all clusters
+            - name: etc-cni-netd
+              mountPath: /etc/cni/net.d/
+              readOnly: true
+            - name: etc-machine-config
+              mountPath: /etc/machine-config-daemon
+              readOnly: true
+            - name: usr-bin
+              mountPath: /usr/local/mount-from-host/bin
+              readOnly: true
+      volumes:
+        - name: var-lib-rancher
+          hostPath:
+            path: "/var/lib/rancher"
+        - name: var-snap                
+          hostPath:
+            path: "/var/snap"
+        - name: etc-origin              
+          hostPath:
+            path: "/etc/origin"
+        - name: etc-systemd
+          hostPath:
+            path: "/etc/systemd"
+        - name: etc-kubernetes
+          hostPath:
+            path: "/etc/kubernetes"
+        - name: lib-systemd
+          hostPath:
+            path: "/lib/systemd"
+        - name: usr-lib
+          hostPath:
+            path: "/usr/lib/systemd"
+        - name: var-lib-etcd
+          hostPath:
+            path: "/var/lib/etcd"
+        - name: var-lib-kubelet
+          hostPath:
+            path: "/var/lib/kubelet"
+        - name: etc-passwd
+          hostPath:
+            path: "/etc/passwd"
+        - name: etc-group
+          hostPath:
+            path: "/etc/group"
+        # UNIVERSAL: OpenShift hostPaths are now applied safely on all clusters
+        - name: etc-cni-netd
+          hostPath:
+            path: "/etc/cni/net.d/"
+        - name: etc-machine-config
+          hostPath:
+            path: "/etc/machine-config-daemon"
+        - name: usr-bin
+          hostPath:
+            path: "/usr/bin"
